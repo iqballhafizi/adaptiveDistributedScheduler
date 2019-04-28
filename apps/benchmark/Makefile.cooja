@@ -1,0 +1,57 @@
+all: $(CONTIKI_PROJECT)
+
+# Insert here the folder of the Preon32 platform
+PREON32DIR=$(CURDIR)/../..
+
+# Set the flag for benchmark app
+CFLAGS+= -DBENCHMARK_APP
+
+# Make sure that the TARGETDIR is correctly set, use the *full path* to contiki for the variable CONTIKI (->path to Makefile.include).
+CONTIKI=/home/user/src/external/contiki
+
+# The project configurations for Cooja
+CFLAGS += -DPROJECT_CONF_H=\"project-conf-cooja.h\"
+
+# Enable IPV6
+CONTIKI_WITH_IPV6=1
+
+# Enable TSCH
+CFLAGS += -DUSE_TSCH=1
+MODULES += core/net/mac/tsch
+MODULES += core/net/mac/tsch/sixtop
+
+# Note: if none of the following 5 flags is set: minimal schedule is used
+
+# Specific flags for sixtop/blacklisting
+CFLAGS+= -DUSE_BLACKLISTING=1
+CFLAGS+= -DTSCH_SFSB
+CFLAGS+= -DTSCH_CONF_WITH_SIXTOP=1
+
+# Activate this for the orchestra scheduler
+# CFLAGS+= -DUSE_ORCHESTRA=1
+# Only if orchestra is enabled
+# APPS += orchestra
+
+# Add some required sources
+PROJECT_SOURCEFILES += idip.c statistics.c neighbor-quality.c contikimac.c contikimac-framer.c chacha.c simplesec.c
+
+# Files in the following directories override implementations of the Contiki master branch
+PROJECTDIRS += $(PREON32DIR)/impl
+PROJECTDIRS += $(PREON32DIR)/impl/net/
+PROJECTDIRS += $(PREON32DIR)/impl/net/llsec
+PROJECTDIRS += $(PREON32DIR)/impl/net/mac
+PROJECTDIRS += $(PREON32DIR)/impl/net/mac/contikimac
+PROJECTDIRS += $(CONTIKI)/core/net/mac/contikimac
+PROJECTDIRS += $(PREON32DIR)/impl/net/mac/tsch
+PROJECTDIRS += $(PREON32DIR)/impl/net/mac/tsch/sixtop
+PROJECTDIRS += $(PREON32DIR)/impl/net/blacklist
+PROJECTDIRS += $(PREON32DIR)/impl/misc
+
+# Include the makefiles for sixtop and blacklisting
+include $(PREON32DIR)/impl/net/mac/tsch/sixtop/Makefile.sixtop
+include $(PREON32DIR)/impl/net/blacklist/Makefile.blacklist
+
+# Include the master Makefile for Contiki
+include $(CONTIKI)/Makefile.include
+
+

@@ -1,0 +1,16 @@
+all: $(CONTIKI_PROJECT)
+
+CONTIKI_WITH_IPV6=1
+
+# Set the flag for benchmark app
+CFLAGS+= -DBENCHMARK_APP
+
+# deactivate tunslip for using command line via serial connection
+CFLAGS+= -DDEACTIVATE_TUNSLIP
+
+CFLAGS+= $(ADD_CFLAGS)  # Additional flags set via do script
+
+PROJECT_SOURCEFILES += idip.c
+
+include $(TARGETDIRS)/preon32/apps/Makefile.common
+include $(CONTIKI)/Makefile.include

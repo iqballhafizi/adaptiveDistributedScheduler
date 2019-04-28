@@ -1,0 +1,2 @@
+CFLAGS+= -DTSCH_SFSB
+CONTIKI_SOURCEFILES += sfsb.c blacklist.c neighbors.c

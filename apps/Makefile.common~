@@ -1,0 +1,24 @@
+# Common settings for all apps
+
+# The following flags are not required for Cooja / only for Preon32
+CFLAGS+= -DDEFAULT_TX_POWER=3
+CFLAGS+= -DWITH_SHUTTLE 
+CFLAGS+= -DSHUTTLE_REV=13
+CFLAGS+= -DPREON32_REV=15
+CFLAGS+= -DPREON32_SUBG=0
+
+# Only if TSCH is used:
+MODULES += core/net/mac/tsch
+
+# Specific flags for sixtop/blacklisting
+CFLAGS+= -DTSCH_SFSB
+CFLAGS+= -DTSCH_CONF_WITH_SIXTOP=1
+
+# Only if orchestra is enabled
+# APPS += orchestra
+
+# Only if sixtop is enabled
+MODULES += core/net/mac/tsch/sixtop
+
+include $(TARGETDIRS)/preon32/impl/net/mac/tsch/sixtop/Makefile.sixtop
+include $(TARGETDIRS)/preon32/impl/net/blacklist/Makefile.blacklist

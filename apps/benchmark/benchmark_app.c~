@@ -1,0 +1,621 @@
+/*
+ * Copyright (c) 2018, Torsten Hueter, Jens Dede, VIRTENIO GmbH.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of the VIRTENIO GmbH nor the
+ *       names of its contributors may be used to endorse or promote products
+ *       derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE VIRTENIO GMBH BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+ /*
+  * Benchmark test for Preon32 (simplified variant)
+  */
+
+#include "benchmark_app.h"
+
+#include "idip.h"
+#include "packet_flags.h"  // flags for UDP packet types
+
+// Contiki includes
+#include <net/ip/uip-udp-packet.h>
+#include <net/rpl/rpl.h>
+#include <net/netstack.h>
+#include <net/ipv6/uip-ds6-nbr.h>
+#include <lib/crc16.h>
+#include <net/ip/uip.h>
+
+// Statistics for Preon32
+#if USE_STATISTICS
+#include <statistics.h>
+#endif
+
+#ifndef UNUSED
+#define UNUSED(x) (void)x
+#endif
+
+// Some includes for Preon32
+#if CONTIKI_TARGET_PREON32 || CONTIKI_TARGET_PREON32L4
+#include <usart.h>
+#else
+#include <node-id.h>
+#endif
+
+#include <stdio.h>
+#include <string.h>
+#include <random.h>
+
+#if USE_ORCHESTRA
+#include "orchestra.h"
+#endif
+
+#if USE_TSCH
+#include "net/mac/tsch/tsch-conf.h"
+#include "net/mac/tsch/tsch-private.h"
+#endif
+
+#include "net/ip/uip-debug.h"
+#include "net/packetbuf.h"
+
+#if USE_BLACKLISTING
+#include "net/blacklist/sfsb.h"
+#include "net/blacklist/blacklist.h"
+uint8_t sfsb_channels[] = { }; // Channels to be blacklisted
+#endif
+
+/// ID of current DAG
+uint16_t dag_id[] = { 0x1111, 0x1100, 0, 0, 0, 0, 0, 0x0011 };
+
+/// This is the default server address
+const uint16_t DEFAULT_SERVER_ADDRESS[] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1 };
+
+/// Get the header from the UDP packet
+#define UDP_HDR ((struct uip_udpip_hdr *)&uip_buf[UIP_LLH_LEN])
+
+static struct uip_udp_conn *udp_conn;           ///< UDP connection for measurements
+static struct uip_udp_conn *control_conn;       ///< UDP control connection
+
+static uip_ipaddr_t prefix;                     ///< Used to configure addresses
+static uip_ipaddr_t ipaddr;                     ///< Used to configure addresses
+static uip_ipaddr_t server_ipaddr;              ///< Destination address for measurements
+
+static unsigned int counter = 0;                ///< Counter sent in measurement packets
+
+/// Sleep time between two packets (measurement)
+static clock_time_t sleepBetweenPackets = DEFAULT_PUSHING_PERIOD;
+
+/// Structure for PRR and statistics
+static statistic_t stat[MAX_STATISTIC_DATA];
+
+static bool resetTimer = false; ///< Used for resetting timer if new interval time was received via config packet
+static bool iAmRoot = false;    ///< Set to true if node is root
+
+// Variables for round trip time calculation
+static rtimer_clock_t lastTransmission = 0;
+static unsigned int lastCounter = 0;
+
+#define BUF ((struct uip_tcpip_hdr *)&uip_buf[UIP_LLH_LEN])
+
+PROCESS(benchmark_app, "Benchmark App");    ///< The benchmark app
+AUTOSTART_PROCESSES(&benchmark_app);        ///< Start the benchmark process
+
+/**
+ * Print the neighbor table including LQI and RSSI
+ */
+void print_neighbor_table(void) {
+    /* print neighbors */
+    PRINTA("\n############    Neighbor table:    ############\n");
+    uip_ds6_nbr_t *nbr;
+    for (nbr = nbr_table_head(ds6_neighbors); nbr != NULL;
+            nbr = nbr_table_next(ds6_neighbors, nbr)) {
+        uip_debug_ipaddr_print(&(nbr->ipaddr));
+        PRINTA(" ");
+    }
+    PRINTA("\n===============================================\n\n");
+}
+
+/**
+ * Prints all local IPv6 addresses to PRINTA
+ *
+ * @brief Print all local IPv6 addresses
+ */
+static void print_local_addresses(void) {
+    int i;
+    uint8_t state;
+
+    PRINTA("Local IPv6 addresses:\n");
+    for (i = 0; i < UIP_DS6_ADDR_NB; i++) {
+        state = uip_ds6_if.addr_list[i].state;
+        if (uip_ds6_if.addr_list[i].isused
+                && (state == ADDR_TENTATIVE || state == ADDR_PREFERRED)) {
+            uip_debug_ipaddr_print(&uip_ds6_if.addr_list[i].ipaddr);
+            PRINTA("\n");
+        }
+    }
+}
+
+/**
+ * Handle incoming IP packets for root node and create simple statistic
+ *
+ * @brief IP handler for root node
+ */
+static void root_tcpip_handler(void) {
+    char *payload;                      ///< Payload of received packet
+    unsigned int totalSentPackets;      ///< Calculated number of total sent packets
+    unsigned int PRR;                   ///< Calculated packet receive ratio
+
+    if (uip_newdata()) {                // new data available
+        uip_ipaddr_t srcIpaddr;         ///< IPv6 address of current received packet
+        uip_ipaddr_t nullIpaddr;        ///< Invalid address
+        uint16_t port;                  ///< Port of current received packet
+        uint8_t id;                     ///< ID of current packet
+
+        payload = uip_appdata;
+
+        memset(&nullIpaddr, 0, sizeof(nullIpaddr));
+
+        uip_ipaddr_copy(&srcIpaddr, &UDP_HDR->srcipaddr);
+        port = uip_ntohs(UDP_HDR->srcport);
+
+        if (memcmp(&srcIpaddr, &nullIpaddr, sizeof(srcIpaddr)) == 0) {
+            PRINTA("Invalid address. Skipping statistic.\n");
+            return;
+        }
+
+        id = addIpAddress(srcIpaddr);
+        if (id) { // valid id
+            unsigned int recvCounter;   ///< Counter of current received packet
+
+            // Copy all information, because packetbuf is overwritten by the reply packet
+            if (payload[0] == BENCHMARK_TYPE_DATA) {
+                memcpy(&recvCounter, &payload[1], sizeof(recvCounter));
+                packetbuf_attr_t rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+                packetbuf_attr_t lqi = packetbuf_attr(PACKETBUF_ATTR_LINK_QUALITY);
+                int hops = UIP_TTL - BUF->ttl + 1;
+
+#if USE_LATENCY_MEASUREMENT
+                // Send a packet back to the node with recvCounter (for timing calculation)
+                char reply[sizeof(char) + sizeof(recvCounter)];
+                reply[0] = BENCHMARK_TYPE_RTT;
+                memcpy(&reply[sizeof(uint8_t)], (char *) &recvCounter, sizeof(recvCounter));
+                uip_udp_packet_sendto(udp_conn, reply, sizeof(char) + sizeof(recvCounter),
+                        &srcIpaddr, UIP_HTONS(MEAS_PORT));
+#endif
+
+                PRINTA("Got packet from ip ");
+                uip_debug_ipaddr_print(&srcIpaddr);
+                PRINTA(" on port %u; Reply was sent.\n", port);
+
+                if (recvCounter > STAT_MINIMUM_COUNT) {
+
+                    // Compute the statistic
+                    if (stat[id - 1].lastReceivedPacket == 0) {
+                        // Only for startup and reset
+                        stat[id - 1].lastReceivedPacket = recvCounter;
+                    }
+                    if (stat[id - 1].firstReceivedPacket == 0) {
+                        // Only for startup and reset
+                        stat[id - 1].firstReceivedPacket = recvCounter;
+                    }
+                    if (recvCounter > stat[id - 1].lastReceivedPacket + 1) {
+                        stat[id - 1].lostPackets = stat[id - 1].lostPackets
+                                + (recvCounter - stat[id - 1].lastReceivedPacket - 1);
+                    }
+                    if (recvCounter < stat[id - 1].lastReceivedPacket) {
+                        PRINTA("!! Restart !! ");
+                        stat[id - 1].firstReceivedPacket = 0;
+                        stat[id - 1].lastReceivedPacket = 0;
+                        stat[id - 1].lostPackets = 0;
+                    }
+
+                    stat[id - 1].lastReceivedPacket = recvCounter;
+                    totalSentPackets = (stat[id - 1].lastReceivedPacket
+                            - stat[id - 1].firstReceivedPacket)+1;
+
+                    if (totalSentPackets != 0) {
+                        PRR = 1000 * (totalSentPackets - stat[id - 1].lostPackets)
+                                / totalSentPackets;
+                    } else {
+                        PRR = 0;
+                    }
+
+                    // Add IP to the database
+                    id = addIpAddress(srcIpaddr);
+                    PRINTA("[Entry %d]", id - 1);
+                    PRINTA(" [Address ");
+                    uip_debug_ipaddr_print(&srcIpaddr);
+                    PRINTA("]");
+
+                    /*
+                     * Dirty fix: TTL could be set in each packet individually. But we cannot
+                     * determine the correct TTL from the sender...
+                     */
+                    PRINTA(" [Hops %u]", hops);
+                    PRINTA(" [Count %u]", recvCounter);
+#if PRINT_PRR
+                    PRINTA(" [Missing %d]", stat[id - 1].lostPackets);
+                    PRINTA(" [Sent %u]", totalSentPackets);
+                    PRINTA(" [PRR ~%d.%d]", PRR / 10, PRR % 10);
+#else
+                    UNUSED(PRR);
+#endif
+                    PRINTA(" [RSSI %u]", rssi);
+                    PRINTA(" [LQI %u]\n", lqi);
+
+                    print_neighbor_table();
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Handle incoming IP traffic for nodes (configuration UDP packets).
+ * Configure the node according to received packet
+ *
+ * @brief Handle incoming traffic for nodes
+ */
+static void node_tcpip_handler(void) {
+    uint8_t tp, cmd;    ///< Type and command of current packet
+    uint16_t timing;    ///< Timing set by current packet
+    uint8_t len;        ///< Payload length of current packet
+    unsigned int recvCounter; ///< Counter of current received packet
+    rtimer_clock_t delayValue; ///< Round trip delay value
+
+    char *payload;      ///< Pointer to received payload
+
+    // New data available
+    if (uip_newdata()) {
+        len = uip_datalen();
+        payload = uip_appdata;
+        if (len > 2) { // correct len? Otherwise erroneous packet
+            tp = payload[0];
+            cmd = payload[1];
+            if (tp == BENCHMARK_TYPE_REQUEST && cmd == BENCHMARK_CMD_TIMING && len == 4) {
+                // Root node requested change in timing
+                memcpy(&timing, (uint16_t *) &payload[2], sizeof(timing));
+                PRINTA("Resetting timing to %u\n", timing);
+                sleepBetweenPackets = timing;
+                resetTimer = true;  // reset timing in benchmark loop to new value
+            } else if (tp == BENCHMARK_TYPE_RTT) {
+                // Compute the round trip time
+                delayValue = RTIMER_CLOCK_DIFF(RTIMER_NOW(), lastTransmission);
+                memcpy((char *)&recvCounter, &payload[sizeof(uint8_t)], sizeof(recvCounter));
+                // Check the counter, because sometimes arrive the packets unordered at the root
+                if (lastCounter == recvCounter){
+                    PRINTA("Got response for packet number %u within %u [ms] \n",
+                            recvCounter, (unsigned int)(delayValue * 1000) / RTIMER_SECOND);
+                }
+            }
+        }
+        else {
+            PRINTA("Got erroneous configuration packet. ignoring.\n");
+        }
+    }
+}
+
+#if !(RPL_CONF_MOP == RPL_MOP_NON_STORING)
+/**
+ * This callback manages the route notification events.
+ *
+ * @param event route notification event
+ * @param route the IP-Address of the actual route.
+ * @param nexthop the IP-Address of the next hop.
+ * @param num_routes the number of the routes.
+ */
+void routeCallback(int event, uip_ipaddr_t *route, uip_ipaddr_t *nexthop, int num_routes) {
+    UNUSED(route);
+    UNUSED(nexthop);
+    switch (event) {
+    case UIP_DS6_NOTIFICATION_ROUTE_ADD:
+        PRINTA("### Route add\n");
+        break;
+    case UIP_DS6_NOTIFICATION_DEFRT_ADD:
+        PRINTA("### Default route add\n");
+        break;
+    case UIP_DS6_NOTIFICATION_ROUTE_RM:
+        PRINTA("### Route rm\n");
+        break;
+    case UIP_DS6_NOTIFICATION_DEFRT_RM:
+        PRINTA("### Default route rm\n");
+        break;
+    default:
+        break;
+    }
+
+    PRINTA("### Number of routes: %d\n", num_routes);
+}
+#endif
+
+static void configureNet(bool isRoot) {
+    if (isRoot){
+        // Set fixed prefix
+        memcpy(&ipaddr, &prefix, sizeof(uip_ipaddr_t) / 2);
+
+        //add fixed IPv6 address
+        uip_ds6_addr_add(&server_ipaddr, 0, ADDR_AUTOCONF);
+
+        // auto-configure IPv6 address
+        uip_ds6_set_addr_iid(&ipaddr, &uip_lladdr);
+        uip_ds6_addr_add(&ipaddr, 0, ADDR_AUTOCONF);
+
+        PRINTA("IP-address: ");
+        uip_debug_ipaddr_print(&ipaddr);
+        PRINTA("\n");
+
+        PRINTA("Fixed IP-address: ");
+        uip_debug_ipaddr_print(&server_ipaddr);
+        PRINTA("\n");
+
+        // start the DAG
+        rpl_dag_t *dag;
+        dag = rpl_set_root(RPL_DEFAULT_INSTANCE, (uip_ip6addr_t *) dag_id);
+
+        if (dag != NULL) {
+            rpl_set_prefix(dag, &prefix, 64);
+            PRINTA("Created a new RPL dag.\n");
+        } else {
+            PRINTA("Error creating new RPL dag!\n");
+        }
+
+        rpl_repair_root(RPL_DEFAULT_INSTANCE);
+    }
+
+    NETSTACK_MAC.on();
+}
+
+
+#if CONTIKI_TARGET_PREON32 || CONTIKI_TARGET_PREON32L4
+/**
+ * Reboots the system.
+ */
+void reboot(void* input){
+    UNUSED(input);
+    PRINTA("Rebooting NOW!\n");
+    while (usart_isAnyBusy()){
+        // NOP
+    }
+    system_softReset(0);
+}
+#endif
+
+/**
+ * Main function. Initialize and call functions according to node role.
+ *
+ * @brief Main function of benchmark APP.
+ */
+PROCESS_THREAD(benchmark_app, ev, data) {
+    UNUSED(data);
+    UNUSED(ev);
+    PROCESS_BEGIN();
+        static struct etimer benchmark_et, benchmark_stop_timer;        ///< Benchmark app event timer
+#if !(RPL_CONF_MOP == RPL_MOP_NON_STORING)
+        static struct uip_ds6_notification note;
+#endif
+        uint8_t i;
+
+#if CONTIKI_TARGET_PREON32 || CONTIKI_TARGET_PREON32L4
+        // Set the deep sleep mode
+        main_setDeepSleep(true);
+
+        // Determine the device role from an GPIO pin
+        GPIO_CONFIG_INPUT_PULLUP(GPIO_ROOT);
+        iAmRoot = !GPIO_GET(GPIO_ROOT);
+#else
+        // Use the mode id from cooja
+        iAmRoot = node_id == 1? true : false;
+#endif
+
+        // Print out the clock interval
+        PRINTA("Unit for clock ticks is (1/%i) seconds (used for etimer etc.)\n", CLOCK_SECOND);
+
+        if (NETSTACK_RADIO.set_value(RADIO_PARAM_TXPOWER, BENCHMARK_TX_POWER) == RADIO_RESULT_OK) {
+            PRINTA("TX-power was set to: %i dBm\n", BENCHMARK_TX_POWER);
+        }
+
+        // Init statistic array
+        for (i = 0; i < MAX_STATISTIC_DATA; i++) {
+            stat[i].firstReceivedPacket = 0;
+            stat[i].lastReceivedPacket = 0;
+            stat[i].lostPackets = 0;
+        }
+
+        // Init id <--> IP converter
+        initIdIp();
+
+        if (iAmRoot) {
+            PRINTA("Device role: ROOT (sink)\n");
+        } else {
+            PRINTA("Device role: NODE (source)\n");
+        }
+
+        etimer_set(&benchmark_et, 2 * CLOCK_SECOND);
+        PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&benchmark_et));
+
+#if USE_BLACKLISTING
+        static struct etimer blacklist_et;        ///< Triggering of blacklist updates
+        etimer_set(&blacklist_et, BLACKLIST_NOTIFY_INTERVAL);
+        sixtop_add_sf(&sfsb_driver);
+	PRINTA("Use_BLACKLIST!!!");
+#endif
+
+        // Set the default prefix
+        uip_ip6addr(&prefix, UIP_DS6_DEFAULT_PREFIX, 0, 0, 0, 0, 0, 0, 0);
+
+        // Set the server IP Address
+        IP6ADDR_SET(server_ipaddr, DEFAULT_SERVER_ADDRESS[0], DEFAULT_SERVER_ADDRESS[1],
+                DEFAULT_SERVER_ADDRESS[2], DEFAULT_SERVER_ADDRESS[3], DEFAULT_SERVER_ADDRESS[4],
+                DEFAULT_SERVER_ADDRESS[5], DEFAULT_SERVER_ADDRESS[6], DEFAULT_SERVER_ADDRESS[7]);
+
+        memcpy(&server_ipaddr, &prefix, sizeof(uip_ipaddr_t) / 2);
+
+        configureNet(iAmRoot);
+
+#if USE_TSCH
+            PRINTA("\nTSCH timeslot length [us]: %i\n", TSCH_DEFAULT_TS_TIMESLOT_LENGTH);
+#if USE_ORCHESTRA
+                PRINTA("ORCHESTRA_CONF_UNICAST_SENDER_BASED: %i\n", ORCHESTRA_UNICAST_SENDER_BASED);
+                PRINTA("ORCHESTRA_CONF_EBSF_PERIOD: %i\n", ORCHESTRA_EBSF_PERIOD);
+                PRINTA("ORCHESTRA_CONF_COMMON_SHARED_PERIOD: %i\n", ORCHESTRA_COMMON_SHARED_PERIOD);
+                PRINTA("ORCHESTRA_CONF_UNICAST_PERIOD: %i\n", ORCHESTRA_UNICAST_PERIOD);
+#else
+            PRINTA("TSCH minimal schedule length [number of slots]: %i \n", TSCH_SCHEDULE_CONF_DEFAULT_LENGTH);
+#endif
+#endif
+
+        //print local address
+        print_local_addresses();
+
+        // connection to listen for incoming data packets from sources
+        udp_conn = udp_new(NULL, UIP_HTONS(MEAS_PORT), NULL);
+        udp_bind(udp_conn, UIP_HTONS(MEAS_PORT));
+
+        // control connection
+        control_conn = udp_new(NULL, UIP_HTONS(CONTROL_PORT), NULL);
+        udp_bind(control_conn, UIP_HTONS(CONTROL_PORT));
+
+        sleepBetweenPackets = DEFAULT_PUSHING_PERIOD;
+
+        // start timer for sending measurement packets
+        etimer_set(&benchmark_et, 600*CLOCK_SECOND);
+ 	etimer_set(&benchmark_stop_timer, 900*CLOCK_SECOND);
+
+#if !(RPL_CONF_MOP == RPL_MOP_NON_STORING)
+        uip_ds6_notification_add(&note, routeCallback);
+#endif
+        // Seed the random generator
+        random_init(crc16_data(linkaddr_node_addr.u8, LINKADDR_SIZE, 0));
+        static int randomOffset = 0;
+        randomOffset = (((int) random_rand() * RANDOM_OFFSET) >> 16);
+
+#if USE_ORCHESTRA
+        orchestra_init();
+#endif /* WITH_ORCHESTRA */
+
+// Simulating restarts
+#if CONTIKI_TARGET_PREON32 || CONTIKI_TARGET_PREON32L4
+#if NODE_RESTART_INTERVAL || ROOT_RESTART_INTERVAL
+        static struct ctimer callbackTimer;       ///< Callback timer for rebooting
+#endif
+        if (!iAmRoot){
+#if NODE_RESTART_INTERVAL
+            PRINTA("Setting node restart interval to: %i seconds\n", NODE_RESTART_INTERVAL);
+            ctimer_set(&callbackTimer, NODE_RESTART_INTERVAL + random_rand() % NODE_RESTART_INTERVAL, reboot, 0);
+#endif
+        } else {
+#if ROOT_RESTART_INTERVAL
+            PRINTA("Setting root restart interval to: %i seconds\n", ROOT_RESTART_INTERVAL);
+            ctimer_set(&callbackTimer, ROOT_RESTART_INTERVAL + random_rand() % ROOT_RESTART_INTERVAL, reboot, 0);
+#endif
+        }
+#endif
+
+        // Main loop
+        while (true) {
+            PROCESS_WAIT_EVENT();
+
+            // handle data packets
+            if (ev == tcpip_event) {
+                if (iAmRoot) {
+                    root_tcpip_handler();  // create statistics on root
+                } else {
+                    node_tcpip_handler();  // receiving config packet on node
+                }
+            }
+
+            if (etimer_expired(&benchmark_et) && (!etimer_expired(&benchmark_stop_timer))) {
+
+#if USE_BLACKLISTING
+                // Blacklisting by hard-coding
+                if (etimer_expired(&blacklist_et)) {
+                   
+                    if (iAmRoot) {
+                        for (i = 0; i < sizeof(sfsb_channels); i++) {
+                            PRINTA("Adding channel: %i for blacklisting!\n", sfsb_channels[i]);
+                            sfsb_bl_add_update(sfsb_channels[i]);
+                        }
+                        sfsb_bl_notify_process();
+                        sfsb_nbr_do_per_nbr(sfsb_bl_send);
+                        sfsb_bl_print();
+                        etimer_set(&blacklist_et, BLACKLIST_NOTIFY_INTERVAL);
+                    }
+                }
+#endif
+
+                if (!iAmRoot && node_id != 2) {  // Root is not sending probe packets
+                    // deactivate debug output on node. Other reasons to activate or deactivate?
+                    if (NODE_DEBUG) {
+                        //print_local_addresses();
+                        PRINTA("Sleep between packets: %lu / %u [s] \n", sleepBetweenPackets, CLOCK_SECOND);
+                        PRINTA("Sending probe packet with counter %u to ip address '", counter);
+                        uip_debug_ipaddr_print(&server_ipaddr);
+                        PRINTA("' and timing %lu / %u [s] \n", sleepBetweenPackets + randomOffset, CLOCK_SECOND);
+                        PRINTA("######\n");
+                        print_local_addresses();
+                        PRINTA("######\n");
+                        print_neighbor_table();
+                    }
+
+                    char payload[PAYLOAD_LENGTH];
+                    payload[0] = BENCHMARK_TYPE_DATA;
+                    memcpy(&payload[1], (char *) &counter, sizeof(counter));
+                    PRINTA("Sending now probe packet with counter %u\n", counter);
+#if CONTIKI_TARGET_PREON32 || CONTIKI_TARGET_PREON32L4
+                    // Wait until string was printed
+                    while(usart_isAnyBusy());
+#endif
+                    // Now send the packet
+                    lastTransmission = RTIMER_NOW();
+                    lastCounter = counter;
+                    uip_udp_packet_sendto(udp_conn, payload, PAYLOAD_LENGTH, &server_ipaddr, UIP_HTONS(MEAS_PORT));
+                    counter++;
+                    randomOffset = (((int) random_rand() * RANDOM_OFFSET) >> 16);
+                    etimer_set(&benchmark_et, sleepBetweenPackets + randomOffset);
+#if USE_STATISTICS
+                    statistics_print();
+#endif
+                } else {
+                    etimer_set(&benchmark_et, CLOCK_SECOND * 60);
+#if USE_STATISTICS
+                    statistics_print();
+#endif
+                }
+#if USE_TSCH
+                PRINTA("TSCH hop sequence: ");
+                for (int i = 0; i < TSCH_HOPPING_SEQUENCE_MAX_LEN; i++) {
+                    if (tsch_hopping_sequence[i] != 0){
+                        PRINTA("%i ", tsch_hopping_sequence[i]);
+                    } else {
+                        break;
+                    }
+                }
+                PRINTA(" \n");
+#endif
+#if USE_STATISTICS
+                    statistics_print();
+#endif
+            }
+else {
+	printf("Stop: stop 10 min expired");
+}
+        }
+    PROCESS_END();
+}

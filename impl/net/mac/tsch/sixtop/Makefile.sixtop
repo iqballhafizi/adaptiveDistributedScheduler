@@ -1,0 +1,2 @@
+CFLAGS+= -DTSCH_CONF_WITH_SIXTOP=1
+CONTIKI_SOURCEFILES += sixp-nbr.c sixp-pkt.c sixp-trans.c sixp.c sixtop.c
